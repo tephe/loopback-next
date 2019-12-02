@@ -6,13 +6,12 @@ sidebar: lb4_sidebar
 permalink: /doc/en/lb4/migration-auth-overview.html
 ---
 
+## LoopBack 3 authentication and authorization facilities
+
 LoopBack version 3 provides several options for adding authentication and
 authorization to secure the applications:
 
-- A set of built-in models like `User`, `AccessToken` and `ACL` makes it easy to
-  store your user credentials locally and define custom access control checks.
-  The migration path is described in
-  [Migrating built-in authentication and authorization](./built-in.md).
+### Authentication
 
 - [loopback-component-passport](https://github.com/strongloop/loopback-component-passport)
   provides integration between LoopBack 3 and
@@ -26,3 +25,27 @@ authorization to secure the applications:
   authorize client applications and/or resource owners (i.e. users) to access
   protected API endpoints. The migration path is described in
   [Migrating OAuth2 provider](./oauth2.md).
+
+### Authorization
+
+- A set of built-in models like `User`, `AccessToken` and `ACL` makes it easy to
+  store your user credentials locally and define custom access control checks.
+  The migration path is described in
+  [Migrating built-in authentication and authorization](./built-in.md).
+
+## LoopBack 4 authentication and authorization facilities
+
+LoopBack 4 focuses on capturing the minimum common metadata for authentication
+and authorization and enabling extensibility so that different security
+strategies/schemes can be plugged in to enforce authentication and
+authorization.
+
+### Authentication
+
+- AuthenticationStrategy
+- PassportAdapter
+
+### Authorization
+
+- Authorizer
+- Use your own interceptor for authorization
