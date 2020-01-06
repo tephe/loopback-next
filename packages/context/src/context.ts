@@ -6,12 +6,17 @@
 import debugFactory from 'debug';
 import {EventEmitter} from 'events';
 import {v1 as uuidv1} from 'uuid';
-import {Binding, BindingTag} from './binding';
+import {Binding, BindingEventListener, BindingTag} from './binding';
 import {
   ConfigurationResolver,
   DefaultConfigurationResolver,
 } from './binding-config';
-import {BindingFilter, filterByKey, filterByTag} from './binding-filter';
+import {
+  BindingFilter,
+  filterByKey,
+  filterByTag,
+  isBindingTagFilter,
+} from './binding-filter';
 import {BindingAddress, BindingKey} from './binding-key';
 import {BindingComparator} from './binding-sorter';
 import {
@@ -54,6 +59,15 @@ import {iterator, multiple} from 'p-event';
 const debug = debugFactory('loopback:context');
 
 /**
+ * Synchronous event listener for the `Context` as en event emitter
+ */
+export type ContextEventListener = (
+  binding: Readonly<Binding<unknown>>, // Binding to be added or removed
+  context: Context, // The source context
+  event: string, // 'bind' or 'unbind'
+) => void;
+
+/**
  * Context provides an implementation of Inversion of Control (IoC) container
  */
 export class Context extends EventEmitter {
@@ -68,6 +82,24 @@ export class Context extends EventEmitter {
   protected readonly registry: Map<string, Binding> = new Map();
 
   /**
+   * Index for bindings by tag names
+   */
+  protected readonly bindingsIndexedByTag: Map<
+    string,
+    Set<Readonly<Binding<unknown>>>
+  > = new Map();
+
+  /**
+   * A listener for binding events
+   */
+  private bindingEventListener: BindingEventListener;
+
+  /**
+   * A listener to maintain tag index for bindings
+   */
+  private tagIndexListener: ContextEventListener;
+
+  /**
    * Parent context
    */
   protected _parent?: Context;
@@ -75,17 +107,9 @@ export class Context extends EventEmitter {
   protected configResolver: ConfigurationResolver;
 
   /**
-   * Event listeners for parent context keyed by event names. It keeps track
-   * of listeners from this context against its parent so that we can remove
-   * these listeners when this context is closed.
+   * A listener to watch parent context events
    */
-  protected _parentEventListeners:
-    | Map<
-        string,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (...args: any[]) => void
-      >
-    | undefined;
+  protected parentEventListener?: ContextEventListener;
 
   /**
    * A list of registered context observers. The Set will be created when the
@@ -128,12 +152,41 @@ export class Context extends EventEmitter {
    */
   constructor(_parent?: Context | string, name?: string) {
     super();
+    // The number of listeners can grow with the number of child contexts
+    // For example, each request can add a listener to the RestServer and the
+    // listener is removed when the request processing is finished.
+    // See https://github.com/strongloop/loopback-next/issues/4363
+    this.setMaxListeners(Infinity);
     if (typeof _parent === 'string') {
       name = _parent;
       _parent = undefined;
     }
     this._parent = _parent;
     this.name = name ?? uuidv1();
+    this.setupTagIndexForBindings();
+  }
+
+  /**
+   * Set up context/binding listeners and refresh index for bindings by tag
+   */
+  private setupTagIndexForBindings() {
+    this.bindingEventListener = (binding, event) => {
+      if (event === 'tag') {
+        this.updateTagIndexForBinding(binding);
+      }
+    };
+    this.tagIndexListener = (binding, context, event) => {
+      if (context !== this) return;
+      if (event === 'bind') {
+        this.updateTagIndexForBinding(binding);
+        binding.on('changed', this.bindingEventListener);
+      } else if (event === 'unbind') {
+        this.removeTagIndexForBinding(binding);
+        binding.removeListener('changed', this.bindingEventListener);
+      }
+    };
+    this.on('bind', this.tagIndexListener);
+    this.on('unbind', this.tagIndexListener);
   }
 
   /**
@@ -161,8 +214,23 @@ export class Context extends EventEmitter {
   private setupEventHandlersIfNeeded() {
     if (this.notificationQueue != null) return;
 
-    this.addParentEventListener('bind');
-    this.addParentEventListener('unbind');
+    if (this._parent != null) {
+      /**
+       * Add an event listener to its parent context so that this context will
+       * be notified of parent events, such as `bind` or `unbind`.
+       */
+      this.parentEventListener = (
+        binding: Readonly<Binding<unknown>>,
+        context: Context,
+        event: string,
+      ) => {
+        this.handleParentEvent(binding, context, event);
+      };
+
+      // Listen on the parent context events
+      this._parent.on('bind', this.parentEventListener!);
+      this._parent.on('unbind', this.parentEventListener!);
+    }
 
     // The following are two async functions. Returned promises are ignored as
     // they are long-running background tasks.
@@ -177,47 +245,32 @@ export class Context extends EventEmitter {
     }
   }
 
-  /**
-   * Add an event listener to its parent context so that this context will
-   * be notified of parent events, such as `bind` or `unbind`.
-   * @param event - Event name
-   */
-  private addParentEventListener(event: string) {
-    if (this._parent == null) return;
-
-    // Keep track of parent event listeners so that we can remove them
-    this._parentEventListeners = this._parentEventListeners ?? new Map();
-    if (this._parentEventListeners.has(event)) return;
-
-    const parentEventListener = (
-      binding: Readonly<Binding<unknown>>,
-      context: Context,
-    ) => {
-      // Propagate the event to this context only if the binding key does not
-      // exist in this context. The parent binding is shadowed if there is a
-      // binding with the same key in this one.
-      if (this.contains(binding.key)) {
-        this._debug(
-          'Event %s %s is not re-emitted from %s to %s',
-          event,
-          binding.key,
-          context.name,
-          this.name,
-        );
-        return;
-      }
+  private handleParentEvent(
+    binding: Readonly<Binding<unknown>>,
+    context: Context,
+    event: string,
+  ) {
+    // Propagate the event to this context only if the binding key does not
+    // exist in this context. The parent binding is shadowed if there is a
+    // binding with the same key in this one.
+    if (this.contains(binding.key)) {
       this._debug(
-        'Re-emitting %s %s from %s to %s',
+        'Event %s %s is not re-emitted from %s to %s',
         event,
         binding.key,
         context.name,
         this.name,
       );
-      this.emit(event, binding, context);
-    };
-    this._parentEventListeners.set(event, parentEventListener);
-    // Listen on the parent context events
-    this._parent.on(event, parentEventListener);
+      return;
+    }
+    this._debug(
+      'Re-emitting %s %s from %s to %s',
+      event,
+      binding.key,
+      context.name,
+      this.name,
+    );
+    this.emit(event, binding, context, event);
   }
 
   /**
@@ -357,9 +410,9 @@ export class Context extends EventEmitter {
     this.registry.set(key, binding);
     if (existingBinding !== binding) {
       if (existingBinding != null) {
-        this.emit('unbind', existingBinding, this);
+        this.emit('unbind', existingBinding, this, 'unbind');
       }
-      this.emit('bind', binding, this);
+      this.emit('bind', binding, this, 'bind');
     }
     return this;
   }
@@ -505,7 +558,7 @@ export class Context extends EventEmitter {
     if (binding?.isLocked)
       throw new Error(`Cannot unbind key "${key}" of a locked binding`);
     this.registry.delete(key);
-    this.emit('unbind', binding, this);
+    this.emit('unbind', binding, this, 'unbind');
     return true;
   }
 
@@ -548,12 +601,13 @@ export class Context extends EventEmitter {
       });
       this.notificationQueue = undefined;
     }
-    if (this._parent && this._parentEventListeners) {
-      for (const [event, listener] of this._parentEventListeners) {
-        this._parent.removeListener(event, listener);
-      }
-      this._parentEventListeners = undefined;
+    if (this._parent && this.parentEventListener) {
+      this._parent.removeListener('bind', this.parentEventListener);
+      this._parent.removeListener('unbind', this.parentEventListener);
+      this.parentEventListener = undefined;
     }
+    this.removeListener('bind', this.tagIndexListener);
+    this.removeListener('unbind', this.tagIndexListener);
   }
 
   /**
@@ -608,6 +662,32 @@ export class Context extends EventEmitter {
   }
 
   /**
+   * Remove tag index for the given binding
+   * @param binding - Binding object
+   */
+  private removeTagIndexForBinding(binding: Readonly<Binding<unknown>>) {
+    for (const [, bindings] of this.bindingsIndexedByTag) {
+      bindings.delete(binding);
+    }
+  }
+
+  /**
+   * Update tag index for the given binding
+   * @param binding - Binding object
+   */
+  private updateTagIndexForBinding(binding: Readonly<Binding<unknown>>) {
+    this.removeTagIndexForBinding(binding);
+    for (const tag of binding.tagNames) {
+      let bindings = this.bindingsIndexedByTag.get(tag);
+      if (bindings == null) {
+        bindings = new Set();
+        this.bindingsIndexedByTag.set(tag, bindings);
+      }
+      bindings.add(binding);
+    }
+  }
+
+  /**
    * Check if a binding exists with the given key in the local context without
    * delegating to the parent context
    * @param key - Binding key
@@ -658,6 +738,11 @@ export class Context extends EventEmitter {
   find<ValueType = BoundValue>(
     pattern?: string | RegExp | BindingFilter,
   ): Readonly<Binding<ValueType>>[] {
+    // Optimize if the binding filter is for tags
+    if (typeof pattern === 'function' && isBindingTagFilter(pattern)) {
+      return this._findByTagIndex(pattern.bindingTag);
+    }
+
     const bindings: Readonly<Binding<ValueType>>[] = [];
     const filter = filterByKey(pattern);
 
@@ -687,6 +772,65 @@ export class Context extends EventEmitter {
     tagFilter: BindingTag | RegExp,
   ): Readonly<Binding<ValueType>>[] {
     return this.find(filterByTag(tagFilter));
+  }
+
+  /**
+   * Find bindings by tag leveraging indexes
+   * @param tag - Tag name pattern or name/value pairs
+   */
+  protected _findByTagIndex<ValueType = BoundValue>(
+    tag: BindingTag | RegExp,
+  ): Readonly<Binding<ValueType>>[] {
+    let tagNames: string[];
+    // A flag to control if a union of matched bindings should be created
+    let union = false;
+    if (tag instanceof RegExp) {
+      // For wildcard/regexp, a union of matched bindings is desired
+      union = true;
+      // Find all matching tag names
+      tagNames = [];
+      for (const t of this.bindingsIndexedByTag.keys()) {
+        if (tag.test(t)) {
+          tagNames.push(t);
+        }
+      }
+    } else if (typeof tag === 'string') {
+      tagNames = [tag];
+    } else {
+      tagNames = Object.keys(tag);
+    }
+    let filter: BindingFilter | undefined;
+    let bindings: Set<Readonly<Binding<ValueType>>> | undefined;
+    for (const t of tagNames) {
+      const bindingsByTag = this.bindingsIndexedByTag.get(t);
+      if (bindingsByTag == null) break; // One of the tags is not found
+      filter = filter ?? filterByTag(tag);
+      const matched = new Set(Array.from(bindingsByTag).filter(filter)) as Set<
+        Readonly<Binding<ValueType>>
+      >;
+      if (!union && matched.size === 0) break; // One of the tag name/value is not found
+      if (bindings == null) {
+        // First set of bindings matching the tag
+        bindings = matched;
+      } else {
+        if (union) {
+          matched.forEach(b => bindings?.add(b));
+        } else {
+          // Now need to find intersected bindings against visited tags
+          const intersection = new Set<Readonly<Binding<ValueType>>>();
+          bindings.forEach(b => {
+            if (matched.has(b)) {
+              intersection.add(b);
+            }
+          });
+          bindings = intersection;
+        }
+        if (!union && bindings.size === 0) break;
+      }
+    }
+    const currentBindings = bindings == null ? [] : Array.from(bindings);
+    const parentBindings = this._parent && this._parent?._findByTagIndex(tag);
+    return this._mergeWithParent(currentBindings, parentBindings);
   }
 
   protected _mergeWithParent<ValueType>(

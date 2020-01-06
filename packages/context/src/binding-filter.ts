@@ -5,6 +5,7 @@
 
 import {Binding, BindingTag} from './binding';
 import {BindingAddress} from './binding-key';
+import {MapObject} from './value-promise';
 
 /**
  * A function that filters bindings. It returns `true` to select a given
@@ -60,26 +61,62 @@ export function isBindingAddress(
 }
 
 /**
+ * Binding filter function that uses tags
+ */
+export interface BindingTagFilter extends BindingFilter<unknown> {
+  bindingTag: BindingTag | RegExp;
+}
+
+/**
+ * Type guard for BindingTagFilter
+ * @param filter - A BindingFilter function
+ */
+export function isBindingTagFilter(
+  filter?: BindingFilter,
+): filter is BindingTagFilter {
+  return filter != null && 'bindingTag' in filter;
+}
+
+/**
  * Create a binding filter for the tag pattern
  * @param tagPattern - Binding tag name, regexp, or object
  */
 export function filterByTag(tagPattern: BindingTag | RegExp): BindingFilter {
-  if (typeof tagPattern === 'string' || tagPattern instanceof RegExp) {
-    const regexp =
-      typeof tagPattern === 'string'
-        ? wildcardToRegExp(tagPattern)
-        : tagPattern;
-    return b => Array.from(b.tagNames).some(t => regexp!.test(t));
+  let filter: BindingFilter;
+  let regex: RegExp | undefined = undefined;
+  if (tagPattern instanceof RegExp) {
+    // RegExp for tag names
+    regex = tagPattern;
+  }
+  if (
+    typeof tagPattern === 'string' &&
+    (tagPattern.includes('*') || tagPattern.includes('?'))
+  ) {
+    // Wildcard tag name
+    regex = wildcardToRegExp(tagPattern);
+  }
+
+  if (regex != null) {
+    // RegExp or wildcard match
+    filter = b => b.tagNames.some(t => regex!.test(t));
+  } else if (typeof tagPattern === 'string') {
+    // Plain tag string match
+    filter = b => b.tagNames.includes(tagPattern);
   } else {
-    return b => {
+    // Match tag name/value pairs
+    const tagMap = tagPattern as MapObject<unknown>;
+    filter = b => {
       for (const t in tagPattern) {
         // One tag name/value does not match
-        if (b.tagMap[t] !== tagPattern[t]) return false;
+        if (b.tagMap[t] !== tagMap[t]) return false;
       }
       // All tag name/value pairs match
       return true;
     };
   }
+  // Set up binding tag for the filter
+  (filter as BindingTagFilter).bindingTag = regex ?? tagPattern;
+  return filter;
 }
 
 /**
