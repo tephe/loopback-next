@@ -12,6 +12,7 @@ if (require.main === module) {
   const config = {
     rest: {
       port: +process.env.PORT || 3000,
+      // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
       host: process.env.HOST || 'localhost',
       openApiSpec: {
         // useful when used with OpenAPI-to-GraphQL to locate your application
