@@ -233,6 +233,12 @@ module.exports = class ServiceGenerator extends ArtifactGenerator {
           this.artifactInfo.dataSourceClass,
         );
 
+        if (!this.artifactInfo.dataSourceName) {
+          return Promise.reject(
+            'Error: datasource config does not have `name` property',
+          );
+        }
+
         this.artifactInfo.dataSourceClassName =
           utils.toClassName(this.artifactInfo.dataSourceName) + 'DataSource';
 
